@@ -1,0 +1,241 @@
+name: terraform-plan-validation-dev
+run-name: Terraform Plan Validation (Dev)
+
+on:
+  pull_request:
+    branches:
+        - 'dev'
+    paths: 
+        - 'infra/**'
+        - 'src/**'
+
+jobs:
+  deploy:
+    
+    # Necessary permissions for OIDC / Workload Identity Federation auth.
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+    runs-on: ubuntu-latest
+    defaults:  
+      run:
+        shell: bash
+        working-directory: infra/environments
+
+    steps:
+
+      # Checkout the repository to the GitHub Actions runner
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      # Initial authentication step (via WIF) which establishes key-less connection
+      # between repository and GCP project (chicago-dataform-dev)
+      - id: 'auth'
+        name: 'Authenticate to Google Cloud'
+        uses: 'google-github-actions/auth@v1'
+        with:
+          create_credentials_file: true
+          workload_identity_provider: ${{ secrets.PROVIDER_NAME_DEV }}
+          service_account: ${{ secrets.SERVICE_ACCOUNT_EMAIL_DEV }}
+
+      # Set up Google Cloud SDK to carry out deployments via remote connection to Cloud Shell.
+      - name: 'Set up Cloud SDK'
+        uses: 'google-github-actions/setup-gcloud@v1'
+        with:
+          project_id: 'chicago-dataform-etl-dev'
+
+      # Install the preferred version of Terraform CLI 
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.8.5
+    
+      # Initializes the terraform configuration     
+      - name: 'Terraform Init'
+        id: init
+        run: terraform init
+
+
+      # Creates a terraform plan which outlines all the resources that will be created.
+      - name: 'Terraform Plan'
+        env: 
+            GIT_TOKEN: ${{ secrets.GHA_TOKEN }}
+            SOCRATA_APP_TOKEN: ${{ secrets.SOCRATA_APP_TOKEN }}
+        id: plan
+        run: |-
+            terraform plan \
+                -var-file="dev/vars.auto.tfvars" \
+                -var="github_token=${GIT_TOKEN}" \
+                -var="gcf_socrata_app_token=${SOCRATA_APP_TOKEN}" \
+                -input=false \
+                -no-color \
+                -compact-warnings \
+                2>&1 | tee plan_output.txt
+            
+            # Check if plan succeeded
+            PLAN_EXIT_CODE=$?
+            if [ $PLAN_EXIT_CODE -ne 0 ]; then
+                echo "Terraform plan failed with exit code $PLAN_EXIT_CODE"
+                echo "has_errors=true" >> $GITHUB_OUTPUT
+                exit $PLAN_EXIT_CODE
+            else
+                echo "has_errors=false" >> $GITHUB_OUTPUT
+            fi
+
+      # Cleans plan output before posting comment to PR
+      # We clean the plan output to make it more verbose and remove 
+      # lengthy warnings that are poorly formatted and offer no value.
+      - name: 'Clean Plan Output'
+        id: clean_plan
+        if: always()
+        run: |
+          set -e
+          
+          # First, check if the plan output exists
+          if [ -f "environments/plan_output.txt" ]; then
+            echo "Found plan output file in environments directory"
+            cp environments/plan_output.txt ./plan_output.txt
+          elif [ -f "plan_output.txt" ]; then
+            echo "Found plan output file in root directory"
+          else
+            echo "No plan output file found, creating empty one"
+            echo "No plan output was generated. This could indicate an issue with the Terraform execution." > plan_output.txt
+          fi
+
+          # Remove the [command] line at the top
+          sed -i '/^\[command\]/d' plan_output.txt
+          sed -i '/^Acquiring state lock\./d' plan_output.txt
+
+          # Remove debug lines
+          sed -i '/^::debug::/d' plan_output.txt
+          
+          # Remove the "Note: You didn't use the -out option" messages (both at start and end)
+          sed -i '/^Note: You didn.*t use the -out option/d' plan_output.txt
+          sed -i '/^guarantee to take exactly/d' plan_output.txt
+
+          # Remove any trailing whitespace
+          sed -i 's/[[:space:]]*$//' plan_output.txt
+
+          # Remove empty lines at the start and end of file
+          sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' plan_output.txt
+          sed -i '/^[[:space:]]*$/d' plan_output.txt
+          
+          # Print the cleaned plan output for debugging
+          echo "Cleaned plan output:"
+          cat plan_output.txt
+
+
+      # Check the status and save the plan output to an 
+      # environment variable.
+      - name: 'Set Plan Status'
+        id: plan_status
+        if: always()
+        run: |
+          if [ -f plan_output.txt ]; then
+              # Check file size
+              FILE_SIZE=$(stat -c%s "plan_output.txt")
+              echo "Plan output file size: $FILE_SIZE bytes"
+              
+              if [ $FILE_SIZE -eq 0 ]; then
+                  echo "plan_output=No plan output available (empty file)" >> $GITHUB_ENV
+              else
+                  echo "plan_output<<EOF" >> $GITHUB_ENV
+                  cat plan_output.txt >> $GITHUB_ENV
+                  echo "EOF" >> $GITHUB_ENV
+              fi
+              
+              if grep -q "Error:" plan_output.txt; then
+                  echo "has_errors=true" >> $GITHUB_OUTPUT
+              else
+                  echo "has_errors=false" >> $GITHUB_OUTPUT
+              fi
+          else
+              echo "plan_output=No plan output file found" >> $GITHUB_ENV
+              echo "has_errors=false" >> $GITHUB_OUTPUT
+          fi
+    
+    
+      - name: PR Comment with Plan
+        id: comment-pr
+        if: always()
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const planStatus = '${{ steps.plan.outcome }}' === 'success' ? '✅' : '❌';
+            
+            const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(comment => {
+                return comment.user.type === 'Bot' && comment.body.includes('Terraform Plan')
+            });
+
+            // Extract resource counts from plan output
+            const planOutput = process.env.plan_output || '';
+            
+            // Parse the plan output for resource changes
+            const parseResourceCounts = (output) => {
+                const counts = {
+                    add: 0,
+                    change: 0,
+                    destroy: 0
+                };
+                
+                // Look for the Plan: line that summarizes changes
+                const planMatch = output.match(/Plan: (\d+) to add, (\d+) to change, (\d+) to destroy/);
+                if (planMatch) {
+                    counts.add = parseInt(planMatch[1]);
+                    counts.change = parseInt(planMatch[2]);
+                    counts.destroy = parseInt(planMatch[3]);
+                }
+                
+                return counts;
+            };
+            
+            const resourceCounts = parseResourceCounts(planOutput);
+            
+            const output = `#### Terraform Plan Summary ${planStatus}
+            #
+            • **Pusher**: @${{ github.actor }}
+            • **Action**: \`${{ github.event_name }}\`
+            • **Workflow**: \`${{ github.workflow }}\`
+            • **Environment**: \`dev\`
+            • **GCP Project**: \`chicago-dataform-dev\`
+            • **Resources to Add**: \`${resourceCounts.add}\`
+            • **Resources to Change**: \`${resourceCounts.change}\`
+            • **Resources to Destroy**: \`${resourceCounts.destroy}\`
+            #
+            <details><summary><b>Show Detailed Plan</b></summary>
+            
+            \`\`\`
+            ${process.env.plan_output || 'No plan output available'}
+            \`\`\`
+            
+            </details>`;
+
+            if (botComment) {
+                await github.rest.issues.deleteComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    comment_id: botComment.id,
+                });
+            }
+            
+            await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: output
+            });
+    
+      - name: Check Plan Status
+        if: always()
+        run: |
+            if [[ "${{ steps.plan_status.outputs.has_errors }}" == "true" ]]; then
+                echo "Terraform plan contained errors"
+                exit 1
+            fi

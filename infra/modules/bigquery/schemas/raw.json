@@ -1,0 +1,98 @@
+[
+    {
+        "name": "id",
+        "type": "INTEGER",
+        "mode": "NULLABLE",
+        "description": "Unique identifier for the crime record."
+    },
+    {
+        "name": "date",
+        "type": "DATE",
+        "mode": "NULLABLE",
+        "description": "Date when the incident occurred. this is sometimes a best estimate."
+    },
+    {
+        "name": "year",
+        "type": "INTEGER",
+        "mode": "NULLABLE",
+        "description": "Year the incident occurred."
+    },
+    {
+        "name": "case_number",
+        "type": "STRING",
+        "mode": "NULLABLE",
+        "description": "The Chicago Police Department RD Number (Records Division Number), which is unique to the incident."
+    },
+    {
+        "name": "arrest",
+        "type": "BOOLEAN",
+        "mode": "NULLABLE",
+        "description": "Indicates whether an arrest was made."
+    },
+    {
+        "name": "primary_type",
+        "type": "STRING",
+        "mode": "NULLABLE",
+        "description": "The primary description of the IUCR code."
+    },
+    {
+        "name": "description",
+        "type": "STRING",
+        "mode": "NULLABLE",
+        "description": "The secondary description of the IUCR code, a subcategory of the primary type."
+    },
+    {
+        "name": "district",
+        "type": "INTEGER",
+        "mode": "NULLABLE",
+        "description": "Indicates the police district where the incident occurred."
+    },
+    {
+        "name": "ward",
+        "type": "INTEGER",
+        "mode": "NULLABLE",
+        "description": "The ward (City Council district) where the incident occurred."
+    },
+    {
+        "name": "community_area",
+        "type": "INTEGER",
+        "mode": "NULLABLE",
+        "description": "Indicates the community area where the incident occurred. Chicago has 77 community areas."
+    },
+    {
+        "name": "block",
+        "type": "STRING",
+        "mode": "NULLABLE",
+        "description": "The partially redacted address where the incident occurred, placing it on the same block as the actual address."
+    },
+    {
+        "name": "location_description",
+        "type": "STRING",
+        "mode": "NULLABLE",
+        "description": "Description of the location where the incident occurred."
+    },
+    {
+        "name": "latitude",
+        "type": "FLOAT",
+        "mode": "NULLABLE",
+        "description": "The latitude of the location where the incident occurred. This location is shifted from the actual location for partial redaction but falls on the same block."
+    },
+    {
+        "name": "longitude",
+        "type": "FLOAT",
+        "mode": "NULLABLE",
+        "description": "The longitude of the location where the incident occurred. This location is shifted from the actual location for partial redaction but falls on the same block."
+    },
+    {
+        "name": "location",
+        "type": "STRING",
+        "mode": "NULLABLE",
+        "description": "The location where the incident occurred in a format that allows for creation of maps and other geographic operations on this data portal. This location is shifted from the actual location for partial redaction but falls on the same block."
+    },
+    {
+        "name": "updated_on",
+        "type": "TIMESTAMP",
+        "mode": "NULLABLE",
+        "description": "Date and time the record was last updated."
+    }
+]

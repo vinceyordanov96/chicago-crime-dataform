@@ -1,0 +1,85 @@
+config {
+	type: "incremental",
+	schema: "transformed",
+	name: "crimes",
+	description: "Daily violent crime statistics by neighborhood",
+	columns: {
+		event_date: "The date of the crime events",
+		event_neighbourhood: "The community area where crimes occurred",
+		homicide_count: "Number of homicides",
+		shootings_count: "Number of shootings involving handguns",
+		theft_count: "Number of thefts",
+		assault_count: "Number of assaults",
+		burglary_count: "Number of burglaries"
+	},
+	bigquery: {
+		partitionBy: "event_date",
+		updatePartitionFilter: "event_date = date_add(current_date(), interval -1 day)"
+	},
+	tags: [
+		"incremental", 
+		"daily"
+	]
+}
+
+-- Pre-execution assertions (if fail, execution will not take place)
+js {
+    const assertionsFactory = require("includes/assertions");
+    const assertions = assertionsFactory(ref);
+	const getDateFilter = () => {
+		if (incremental()) {
+			return `date(date) = date_add(current_date(), interval -1 day)`;
+		}
+		return "1=1";
+	}
+}
+
+pre_operations {
+    with
+       source_data_check as ( ${assertions.checkSourceDataExists("chicago-crime-all")} ),
+       unique_ids_check as ( ${assertions.uniqueCaseIds("chicago-crime-all")} ),
+       critical_fields_check as ( ${assertions.checkCriticalFields("chicago-crime-all")} ),
+       community_areas_check as ( ${assertions.validateCommunityAreas("chicago-crime-all")} ),
+       crime_types_check as ( ${assertions.validateCrimeTypes("chicago-crime-all")} ),
+       future_dates_check as ( ${assertions.checkFutureDates("chicago-crime-all")} )
+   select 
+       case
+           when (select count(*) from unique_ids_check) > 0 then error('Found duplicate case IDs')
+           when not (select assertion_result from source_data_check) then error('No source data available')
+           when not (select assertion_result from critical_fields_check) then error('Critical fields validation failed')
+           when not (select assertion_result from community_areas_check) then error('Community areas validation failed') 
+           when not (select assertion_result from crime_types_check) then error('Crime types validation failed')
+           when not (select assertion_result from future_dates_check) then error('Future dates found in source')
+           else true 
+       end as assertions_passed
+}
+
+
+-- Main CTE 
+with crime as (
+    select
+        date(date) AS event_date,
+        community_area AS event_neighbourhood,
+        count(case when primary_type = "HOMICIDE" then 1 end) as homicide_count,
+        count(case when primary_type = "BATTERY" AND description LIKE "%HANDGUN" then 1 end) as shootings_count,
+        count(case when primary_type = "THEFT" then 1 end) as theft_count,
+        count(case when primary_type = "ASSAULT" then 1 end) as assault_count,
+        count(case when primary_type = "BURGLARY" then 1 end) as burglary_count
+    from
+        ${ref("chicago-crime-all")}
+    where
+		-- Select only a subset of data if runtime environment is dev.
+		${getDateFilter()}
+		${
+			when(
+				dataform.projectConfig.vars.is_dev_env,
+				`and community_area in (1,2,3,4,5,23,41,71,22,13)`
+			)
+		}
+    group by 1,2
+)
+
+select 
+	* 
+from 
+	crime

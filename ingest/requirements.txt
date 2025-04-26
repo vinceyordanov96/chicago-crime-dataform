@@ -1,0 +1,8 @@
+# pip freeze > requirements.txt
+google-cloud-workflows
+google-cloud-secret-manager
+google-cloud-bigquery
+functions-framework
+pandas
+sodapy
+dotenv

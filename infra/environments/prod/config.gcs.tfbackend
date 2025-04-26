@@ -1,0 +1,7 @@
+# Location of Terraform state
+# This value is identical to the one in its dev/config.gcs.tfbackend counterpart
+# However, we retain the structure of de-coupling the environments to allow for
+# easily splitting the TF configurations to point to different GCP projects in 
+# the future. 
+
+bucket = "your-backend-gcs-bucket"

@@ -1,0 +1,6 @@
+config {
+    type: "declaration",
+    database: "your-gcp-project-id",
+    schema: "your-raw-dataset-id",
+    name: "your-raw-table-id",
+}

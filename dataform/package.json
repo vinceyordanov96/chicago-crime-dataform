@@ -1,0 +1,6 @@
+{
+	"name": "chicago-dataform-etl",
+	"dependencies": {
+		"@dataform/core": "3.0.0"
+	}
+}

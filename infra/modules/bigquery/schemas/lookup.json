@@ -1,0 +1,20 @@
+[
+    {
+        "name": "state",
+        "type": "STRING",
+        "mode": "NULLABLE",
+        "description": "State of the current Dataform execution."
+    },
+    {
+        "name": "timestamp",
+        "type": "TIMESTAMP",
+        "mode": "NULLABLE",
+        "description": "Timestamp for when the current execution state is logged."
+    },
+    {
+        "name": "environment",
+        "type": "STRING",
+        "mode": "NULLABLE",
+        "description": "Reference to environment which is being executed"
+    }
+]

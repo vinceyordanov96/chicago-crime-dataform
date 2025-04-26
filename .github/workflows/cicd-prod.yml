@@ -1,0 +1,90 @@
+name: update-dataform-project-prod
+run-name: Dataform Project CI Layer (Prod)
+
+on:
+  push:
+    branches:
+        - 'main'
+    paths: 
+        - 'infra/**'
+        - 'src/**'
+
+jobs:
+  deploy:
+    
+    # Necessary permissions for OIDC / Workload Identity Federation auth.
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+    runs-on: ubuntu-latest
+    defaults:  
+      run:
+        shell: bash
+        working-directory: infra/environments
+
+    steps:
+
+      # Checkout the repository to the GitHub Actions runner
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      # Initial authentication step (via WIF) which establishes key-less connection
+      # between repository and GCP project (chicago-dataform-prod)
+      - id: 'auth'
+        name: 'Authenticate to Google Cloud'
+        uses: 'google-github-actions/auth@v1'
+        with:
+          create_credentials_file: true
+          workload_identity_provider: ${{ secrets.PROVIDER_NAME_PROD }}
+          service_account: ${{ secrets.SERVICE_ACCOUNT_EMAIL_PROD }}
+
+      # Set up Google Cloud SDK to carry out deployments via remote connection to Cloud Shell.
+      - name: 'Set up Cloud SDK'
+        uses: 'google-github-actions/setup-gcloud@v1'
+        with:
+          project_id: 'chicago-dataform-etl-prod'
+
+      # Install the preferred version of Terraform CLI 
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.8.5
+    
+      # Initializes the terraform configuration     
+      - name: 'Terraform Init'
+        id: init
+        run: terraform init
+  
+      # Rewrites Terraform configuration files to a canonical format and style for 
+      # readability (not a breaking check, will run if fails)
+      - name: 'Terraform format'
+        id: fmt
+        run: terraform fmt -check
+        continue-on-error: true
+
+
+      # Creates a terraform plan which outlines all the resources that will be created.
+      - name: 'Terraform Plan'
+        env: 
+            GIT_TOKEN: ${{ secrets.GHA_TOKEN }}
+            SOCRATA_APP_TOKEN: ${{ secrets.SOCRATA_APP_TOKEN }}
+        id: plan
+        run: |-
+            terraform plan \
+                -var-file="prod/vars.auto.tfvars" \
+                -var="github_token=${GIT_TOKEN}" \
+                -var="gcf_socrata_app_token=${SOCRATA_APP_TOKEN}" \
+                -input=false \
+                -out="prod.tfplan"
+
+      # Creates all specified cloud resources according to the terraform plan step, only if a PR is merged.
+      - name: Terraform Apply
+        id: apply
+        env: 
+            GIT_TOKEN: ${{ secrets.GHA_TOKEN }}
+            SOCRATA_APP_TOKEN: ${{ secrets.SOCRATA_APP_TOKEN }}
+        run: |-
+            terraform apply \
+                -input=false \
+                -auto-approve \
+                prod.tfplan

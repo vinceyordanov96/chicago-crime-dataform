@@ -1,0 +1,411 @@
+# ------------------------------------------------------------ Job 1 ---------------------------------------------------------------- #
+# This job configures the execution settings based on the GCP project env variable. The configuration sets the Git Commitish,
+# environment, gcp project, dataform tag, repository full path, and output topic to which failed execution alerts are sent.
+# It also defines the template queries used to update the BQ run log lookup table with the state of the current execution.
+# ------------------------------------------------------------------------------------------------------------------------------------ # 
+# init:
+#   params: [
+#     project_id, 
+#     env, 
+#     lookup_table, 
+#     location
+#   ]
+main:
+  steps:
+    - init:
+        assign:
+          # Read parameters from workflow execution input
+          - params: $${json.decode(sys.get_env("GOOGLE_CLOUD_WORKFLOW_EXECUTION_ARGUMENTS"))}
+          - gcp_project: $${params.project_id}
+          - git_commitish: $${params.env}
+          - environment: $${params.env}
+          - lookup_table: $${params.project_id+".lookup."+params.lookup_table}
+          - repository: $${"projects/"+ params.project_id+"/locations/"+params.location+"/repositories/chicago-dataform-etl"}
+          - release_config: $${"projects/"+ params.project_id+"/locations/"+params.location+"/repositories/chicago-dataform-etl/releaseConfigs/"+params.env}
+          - compilation_type: $${params.compilation.type}
+          - start_date: $${params.compilation.start_date}
+          - end_date: $${params.compilation.end_date}
+
+    # Placeholders to be populated later on; used to log the state of
+    # the current execution as well as to check the state of the most
+    # recent execution 
+    - queries_init:
+        assign: 
+          - query_auto_approve: >-
+              declare num_rows int64;
+              set num_rows = (
+                select 
+                  ifnull(
+                    count(timestamp),
+                    0
+                  ) 
+                from 
+                  `replace`
+              );
+              if num_rows = 0 then 
+                insert into `replace`
+                select
+                  current_timestamp() as timestamp,
+                  "APPROVED" as state,
+                  "rplc_env" as environment;
+              else 
+                select NULL;
+              end if
+
+          - query_pipeline_run_log_write: >-
+              insert into `replace`
+              select
+                current_timestamp() as timestamp,
+                "rplc_state" as state,
+                "rplc_env" as environment
+
+          - query_pipeline_run_log_read: >-
+              with temp as (
+                select 
+                  timestamp, 
+                  state
+                from 
+                  `replace`
+                where environment = "rplc_env"
+                order by timestamp desc
+                limit 1
+              )
+              select
+                case
+                  when state = "SUCCEEDED" then true
+                  when state = "APPROVED" then true
+                  when state = "RUNNING" and timestamp >= timestamp_sub(current_timestamp(), interval 24 hour) then false
+                  when state = "RUNNING" and timestamp < timestamp_sub(current_timestamp(), interval 24 hour) then true
+                  when state in ("FAILED", "CANCELLED") and timestamp < timestamp_sub(current_timestamp(), interval 10 minute) then true
+                  when state in ("FAILED", "CANCELLED") and timestamp >= timestamp_sub(current_timestamp(), interval 10 minute) then false
+                  else false
+                end as result
+              from temp
+
+    # Calls on Job 2 below and passes in necessary arguments.
+    - full_environment_run:
+        call: full_environment
+        args:
+          gcp_project: $${gcp_project}
+          environment: $${environment}
+          git_commitish: $${git_commitish}
+          repository: $${repository}
+          release_config: $${release_config}
+          query_auto_approve: $${query_auto_approve}
+          query_pipeline_run_log_read: $${query_pipeline_run_log_read}
+          query_pipeline_run_log_write: $${query_pipeline_run_log_write}
+          lookup_table: $${lookup_table}
+          compilation_type: $${compilation_type}
+          start_date: $${start_date}
+          end_date: $${end_date}
+
+
+# ------------------------------------------------------------ Job 2 ---------------------------------------------------------------- #
+# This subworkflow first populates and runs the auto approval query to ensure the pipeline is still triggered even if this is an 
+# initial deployment. It checks the run log for the approval to run an environment, and if the approval is given, the environment is
+# executed. It also retreives the final state of the execution, and if the state is failed, the slack alert system is activated. 
+# ------------------------------------------------------------------------------------------------------------------------------------ # 
+full_environment:
+  params: [
+    gcp_project, 
+    environment, 
+    git_commitish, 
+    repository, 
+    release_config,
+    query_auto_approve, 
+    query_pipeline_run_log_read, 
+    query_pipeline_run_log_write,
+    lookup_table,
+    compilation_type,
+    start_date,
+    end_date
+  ]
+  steps:
+
+    - improve_query_auto_approve:
+        call: text.replace_all
+        args: 
+          source: $${query_auto_approve}
+          substr: replace
+          repl: $${lookup_table}
+        result: intermediate_query_auto_approve
+
+    - finalise_query_auto_approve:
+        call: text.replace_all 
+        args:
+          source: $${intermediate_query_auto_approve}
+          substr: rplc_env
+          repl: $${environment}
+        result: finalised_query_auto_approve
+
+    - run_query_auto_approve: 
+        try:
+            call: googleapis.bigquery.v2.jobs.query
+            args:
+                projectId: $${gcp_project}
+                body:
+                    query: $${finalised_query_auto_approve}
+                    location: EU
+                    useLegacySql: false
+            result: query_auto_approve_result
+        retry:
+            predicate: $${retry.always}
+            max_retries: 60
+            backoff:
+                initial_delay: 10
+                max_delay: 60
+                multiplier: 2
+    
+
+  # populate the log_read placeholder queries being called later.
+    - improve_query_pipeline_run_log_read:
+        call: text.replace_all
+        args:
+          source: $${query_pipeline_run_log_read}
+          substr: replace
+          repl: $${lookup_table}
+        result: intermediate_query_pipeline_run_log_read
+
+
+    - finalise_query_pipeline_run_log_read:
+        call: text.replace_all
+        args:
+          source: $${intermediate_query_pipeline_run_log_read}
+          substr: rplc_env
+          repl: $${environment}
+        result: finalised_query_pipeline_run_log_read_env
+
+    # Run query to check the state of the previous execution
+    - run_query_pipeline_run_log_read:
+        try:
+            call: googleapis.bigquery.v2.jobs.query
+            args:
+                projectId: $${gcp_project}
+                body:
+                    query: $${finalised_query_pipeline_run_log_read_env}
+                    location: EU
+                    useLegacySql: false
+            result: query_pipeline_run_log_read_result
+        retry:
+            predicate: $${retry.always}
+            max_retries: 60
+            backoff:
+                initial_delay: 10
+                max_delay: 60
+                multiplier: 2
+    
+    # if the state is SUCCESSFUL or APPROVED we run the dataform iteration job that is defined below.  
+    - env_exec_switch: 
+        switch:
+            - condition: $${query_pipeline_run_log_read_result.rows[0].f[0].v == "true"}
+              steps:
+                - execute_dataform_iteration:
+                    call: dataform_iteration
+                    args:
+                        baseURL: $${"https://dataform.googleapis.com/v1/"+repository}
+                        environment: $${environment}
+                        query_pipeline_run_log_write: $${query_pipeline_run_log_write}
+                        gcp_project: $${gcp_project}
+                        git_commitish: $${git_commitish}
+                        repository: $${repository}
+                        release_config: $${release_config}
+                        lookup_table: $${lookup_table}
+                        compilation_type: $${compilation_type}
+                        start_date: $${start_date}
+                        end_date: $${end_date}
+                    result: dataform_state
+
+                # TODO: if the dataform state, which we obtain as a result from the dataform_iteration job is a failure, we publish 
+                # a message to some slack alert channels.
+                - publish_message_to_topic:
+                    switch:
+                        - condition: $${dataform_state == "FAILED"}
+                          steps:
+                            - log_success:
+                                call: sys.log
+                                args:
+                                    text: $${"The pipeline execution was successful for "+environment}
+                                    severity: INFO
+                        - condition: true
+                          steps:
+                            - log_env_no_publish:
+                                    call: sys.log
+                                    args:
+                                        text: $${"a message will not be published to the topic based on the dataform status response for "+environment}
+                                        severity: INFO
+            - condition: true
+              steps:
+                - log_pipeline_env_no_run:
+                    call: sys.log
+                    args:
+                        text: $${"the environment "+environment+" will not be executed based on what has been read in the BQ run log lookup table"}
+                        severity: INFO
+
+
+
+# ------------------------------------------------------ Job 3. ---------------------------------------------------------------------- #
+# this job triggers dataform for specific environment and regularly performs checks on the triggered execution. 
+# ------------------------------------------------------------------------------------------------------------------------------------ # 
+dataform_iteration:
+  params: [
+    baseURL, 
+    environment, 
+    query_pipeline_run_log_write, 
+    gcp_project, 
+    git_commitish, 
+    repository, 
+    release_config,
+    lookup_table,
+    compilation_type,
+    start_date,
+    end_date
+  ]
+  steps:
+
+    # Set up compilation config based on type:
+    # We use a switch statement to determine the compilation config
+    # based on the run_type that was passed in as a parameter. In cases
+    # where the run_type is "backfill", we assign the start_date and end_date
+    # to the compilation config.
+    - setupCompilationConfig:
+        switch:
+          - condition: $${compilation_type == "daily"}
+            assign:
+              - compilation_config:
+                  releaseConfig: $${release_config}
+          - condition: true
+            assign:
+              - compilation_config:
+                  releaseConfig: $${release_config}
+                  configOverride:
+                    vars:
+                      start_date: $${start_date}
+                      end_date: $${end_date}
+
+
+    # POST request is made to the compilationResult endpoint to retrieve the compiled workflow linked to the appropriate git commitish.
+    # We override the defaultDatabase (GCP project), assigning whatever value we determined for gcp_project in the init step.
+    # Retry policy with exponential backoff is necessary here because sometimes we get an ERROR 400 due to faulty connection with the git
+    # repository that is hosting the Dataform project.
+    - createCompilationResult:
+        try:
+          call: http.post
+          args:
+              url: $${"https://dataform.googleapis.com/v1/" + repository + "/compilationResults"}
+              auth:
+                  type: OAuth2
+              body: $${compilation_config}
+          result: compilationResult
+        retry:
+          predicate: $${retry.always}
+          max_retries: 5
+          backoff:
+            initial_delay: 10
+            max_delay: 60
+            multiplier: 2
+    
+    # Store compilation result name
+    - storeCompilationResultName:
+        assign:
+          - compilationResultName: $${compilationResult.body.name}
+    
+    # Set up workflow invocation config based on type
+    - setupInvocationConfig:
+        switch:
+          - condition: $${compilation_type == "full_backfill"}
+            assign:
+              - invocation_config:
+                  invocationConfig:
+                    fullyRefreshincrementalTablesEnabled: true
+                  compilationResult: $${compilationResultName}
+          - condition: true
+            assign:
+              - invocation_config:
+                  invocationConfig:
+                    fullyRefreshincrementalTablesEnabled: false
+                  compilationResult: $${compilationResultName}
+
+    # We make an API request to invoke the dataform workflow
+    - createWorkflowinvocation:
+        try:
+          call: http.post
+          args:
+              url: $${"https://dataform.googleapis.com/v1/" + repository + "/workflowinvocations"}
+              auth:
+                  type: OAuth2
+              body: $${invocation_config}
+          result: workflowinvocation
+        retry:
+          predicate: $${retry.always}
+          max_retries: 5
+          backoff:
+            initial_delay: 10
+            max_delay: 60
+            multiplier: 2
+
+      # Replace the placeholder text in the queries defined in the previous step. (project suffix, environment name, state)
+    - modify_query_pipeline_run_log_write:
+        call: text.replace_all
+        args:
+            source: $${query_pipeline_run_log_write}
+            substr: replace
+            repl: $${lookup_table}
+        result: modified_query_pipeline_run_log_write_table
+
+    - query_pipeline_run_log_write_environment:
+        call: text.replace_all
+        args:
+            source: $${modified_query_pipeline_run_log_write_table}
+            substr: rplc_env
+            repl: $${environment}
+        result: modified_query_pipeline_run_log_write_env
+
+    - query_pipeline_run_log_write_state_start:
+        call: text.replace_all
+        args:
+            source: $${modified_query_pipeline_run_log_write_env}
+            substr: rplc_state
+            repl: RUNNING
+        result: finalised_query_pipeline_run_log_write_state_start
+
+    # Log the state of the execution as soon as it starts
+    - run_query_pipeline_run_log_write_start:
+        try:
+            call: googleapis.bigquery.v2.jobs.query
+            args:
+                projectId: $${gcp_project}
+                body:
+                    query: $${finalised_query_pipeline_run_log_write_state_start}
+                    location: EU
+                    useLegacySql: false
+            result: query_pipeline_run_log_write_start_result
+        retry:
+            predicate: $${retry.always}
+            max_retries: 60
+            backoff:
+                initial_delay: 10
+                max_delay: 60
+                multiplier: 2
+
+    # Continuously check the state of the most recent workflow invocation.
+    - request_dataform_status:
+        try:
+          steps:
+            - pull_status:
+                call: http.get
+                args:
+                  url: $${"https://dataform.googleapis.com/v1/" + workflowinvocation.body.name}
+                  auth:
+                      type: OAuth2
+                result: dataform_status_response
+            - parse_status:
+                switch:
+                  - condition: $${dataform_status_response.body.state == "RUNNING"}
+                    raise: "Dataform iteration is not complete yet"
+        retry:
+          predicate: $${retry.always}
+          max_retries: 2000
+          backoff:
+              initial_delay: 10
+              max_delay: 60
+              multiplier: 2
