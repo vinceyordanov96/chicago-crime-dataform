@@ -346,8 +346,7 @@ def processData(df: pd.DataFrame) -> pd.DataFrame:
 
 def uploadToBigQuery(df : pd.DataFrame, project_id: str) -> bool:
     """
-    Creates the BigQuery dv360 incremental table
-    and Uploads the processed data to it.
+    Uploads the processed data to the raw chicago crime table.
 
     Args:
         df: The dataframe to be uploaded
